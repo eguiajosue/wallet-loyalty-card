@@ -1,0 +1,12 @@
+{
+  "name": "wallet-loyalty-card",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c green,blue \"npm run dev -w @wallet/api\" \"npm run dev -w @wallet/web\"",
+    "build": "npm run build -w @wallet/api && npm run build -w @wallet/web",
+    "test": "npm run test -w @wallet/api",
+    "db:migrate": "npm run db:migrate -w @wallet/api"
+  },
+  "devDependencies": {"concurrently": "^9.2.1"}
+}
