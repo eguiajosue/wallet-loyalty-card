@@ -33,5 +33,7 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run db:migrate
+      - name: Verify migrations can run again safely
+        run: npm run db:migrate
       - run: npm run test:integration -w @wallet/api
       - run: npm run build

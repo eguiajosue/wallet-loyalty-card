@@ -6,6 +6,7 @@ import { AuthService, digest } from './auth';
 import { Database } from './db';
 import { checkVisit } from './rules';
 import { parse, uuid } from './validation';
+import { recordAudit } from './audit';
 
 const campaignSchema = z.object({
   name: z.string().trim().min(2).max(120),
@@ -73,20 +74,24 @@ export class LoyaltyService {
     return { id, cardUrl: `${base}/card/${token}`, token };
   }
 
-  private async cardRow(client: PoolClient | Database, token: string, lock = false): Promise<CardRow> {
+  private async cardRow(client: PoolClient | Database, token: string, lock = false, tenantId?: string): Promise<CardRow> {
     parse(tokenSchema, token);
     const sql = `SELECT e.id, e.tenant_id, e.campaign_id, e.visit_count, e.state, c.name,
          c.reward_description, c.target_visits, c.min_purchase_cents, c.cooldown_minutes,
          c.ends_at, c.status, t.name AS business_name
        FROM enrollments e JOIN campaigns c ON c.id = e.campaign_id AND c.tenant_id = e.tenant_id
-       JOIN tenants t ON t.id = e.tenant_id WHERE e.token_hash = $1
+       JOIN tenants t ON t.id = e.tenant_id WHERE e.token_hash = $1 ${tenantId ? 'AND e.tenant_id = $2' : ''}
        ${lock ? 'FOR UPDATE OF e' : ''}`;
     const result = client instanceof Database
-      ? await client.query<CardRow>(sql, [digest(token)])
-      : await client.query<CardRow>(sql, [digest(token)]);
+      ? await client.query<CardRow>(sql, tenantId ? [digest(token), tenantId] : [digest(token)])
+      : await client.query<CardRow>(sql, tenantId ? [digest(token), tenantId] : [digest(token)]);
     const card = result.rows[0];
     if (!card) throw new NotFoundException('Tarjeta no encontrada');
     return card;
+  }
+
+  tenantCard(client: PoolClient, tenantId: string, token: string) {
+    return this.cardRow(client, token, true, tenantId);
   }
 
   async getCard(token: string) {
@@ -109,21 +114,22 @@ export class LoyaltyService {
     const key = parse(keySchema, idempotencyKey);
     try {
       return await this.db.transaction(async (client) => {
-        const card = await this.cardRow(client, token, true);
-        if (card.tenant_id !== tenantId) throw new NotFoundException('Tarjeta no encontrada');
-        const prior = await client.query<{ id: string; enrollment_id: string; ticket_number: string; amount_cents: number; resulting_count: number }>(
-          'SELECT id, enrollment_id, ticket_number, amount_cents, resulting_count FROM visits WHERE tenant_id = $1 AND idempotency_key = $2', [tenantId, key],
+        const card = await this.tenantCard(client, tenantId, token);
+        const prior = await client.query<{ id: string; enrollment_id: string; branch_id: string; ticket_number: string; amount_cents: number; resulting_count: number }>(
+          'SELECT id, enrollment_id, branch_id, ticket_number, amount_cents, resulting_count FROM visits WHERE tenant_id = $1 AND idempotency_key = $2', [tenantId, key],
         );
         if (prior.rows[0]) {
           const p = prior.rows[0];
-          if (p.enrollment_id !== card.id || p.ticket_number !== data.ticketNumber || p.amount_cents !== data.amountCents) {
+          if (p.enrollment_id !== card.id || p.branch_id !== data.branchId || p.ticket_number !== data.ticketNumber || p.amount_cents !== data.amountCents) {
             throw new ConflictException('La clave de idempotencia ya se usó para otra operación');
           }
           return { visitId: p.id, visitCount: p.resulting_count, rewardReady: p.resulting_count >= card.target_visits, replayed: true };
         }
         const branch = await client.query('SELECT 1 FROM branches WHERE id = $1 AND tenant_id = $2', [data.branchId, tenantId]);
         if (!branch.rowCount) throw new BadRequestException('Sucursal no válida para este negocio');
-        const last = await client.query<{ created_at: Date }>('SELECT created_at FROM visits WHERE enrollment_id = $1 ORDER BY created_at DESC LIMIT 1', [card.id]);
+        const last = await client.query<{ created_at: Date }>(`SELECT v.created_at FROM visits v WHERE v.enrollment_id = $1
+          AND NOT EXISTS (SELECT 1 FROM cancellation_requests cr WHERE cr.visit_id = v.id AND cr.status = 'approved')
+          ORDER BY v.created_at DESC LIMIT 1`, [card.id]);
         const now = new Date();
         const reason = checkVisit({
           status: card.status, endsAt: card.ends_at, state: card.state, visitCount: card.visit_count,
@@ -140,6 +146,8 @@ export class LoyaltyService {
           [visitId, tenantId, card.id, data.branchId, actor.user_id, data.ticketNumber, data.amountCents, key, count, now],
         );
         await client.query("UPDATE enrollments SET visit_count = $1, state = $2 WHERE id = $3", [count, count >= card.target_visits ? 'reward_ready' : 'active', card.id]);
+        await recordAudit(client, tenantId, card.id, actor.user_id, 'visit.recorded', { visitId, visitCount: count });
+        if (count >= card.target_visits) await recordAudit(client, tenantId, card.id, actor.user_id, 'reward.unlocked', { visitId, visitCount: count });
         return { visitId, visitCount: count, rewardReady: count >= card.target_visits, replayed: false };
       });
     } catch (error) {

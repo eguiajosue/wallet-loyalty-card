@@ -17,6 +17,6 @@ export async function backendWithSession(path: string, init: RequestInit = {}) {
 export async function relay(response: Response) {
   return new Response(await response.text(), {
     status: response.status,
-    headers: { 'Content-Type': response.headers.get('content-type') ?? 'application/json' },
+    headers: { 'Content-Type': response.headers.get('content-type') ?? 'application/json', 'Cache-Control': 'no-store' },
   });
 }
